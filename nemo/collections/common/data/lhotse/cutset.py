@@ -465,13 +465,38 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
 
 
 def cut_to_conversation(
-    cut: Cut, audio_locator_tag: str, token_equivalent_duration: float
+    cut: Cut,
+    audio_locator_tag: str,
+    token_equivalent_duration: float,
+    use_itn: bool = True,
+    use_whisper_result: bool = True,
 ) -> NeMoMultimodalConversation:
     """
     Converts a lhotse Cut into a two-turn NeMoMultimodalConversation, where the user turn contains cut's audio,
-    and assistant turn contains text response from ``cut.supervisions[0].text``.
+    and assistant turn contains text response from reference text.
 
-    If ``cut`` has a custom field ``context``, it's pre-pended as an extra user text turn before the user's audio turn.
+    The reference text is selected using configurable priority-based logic from custom metadata fields,
+    matching se-trainer's behavior with use_itn and use_whisper_result flags.
+
+    Priority hierarchy (when both flags are True):
+        1. custom.ground_truth_transcript (highest priority, always used if present)
+        2. custom.itn (conditional on use_itn=True)
+        3. custom.whisper_result (conditional on use_whisper_result=True and richness check)
+        4. supervisions[0].text (fallback)
+
+    Args:
+        cut: Lhotse Cut object
+        audio_locator_tag: Special token for audio placeholder in text
+        token_equivalent_duration: Audio duration per token conversion ratio
+        use_itn: Enable ITN text usage (default: True)
+        use_whisper_result: Enable whisper_result usage (default: True)
+
+    Returns:
+        NeMoMultimodalConversation with configured text selection
+
+    Note:
+        Maintains 100% backward compatibility - defaults to True for both flags.
+        If custom fields don't exist, uses supervisions[0].text as before.
     """
     if isinstance(cut, NeMoMultimodalConversation):
         return cut
@@ -481,9 +506,17 @@ def cut_to_conversation(
         # Replace the placeholder recording with the actual audio data from custom field
         cut.recording = cut.custom['data']
 
+    # ENHANCED: Use configurable priority-based text selection from custom metadata fields
+    # This imports the helper function only when needed to avoid circular dependencies
+    from nemo.collections.speechlm2.data.text_utils import get_reference_text_with_priority
+
+    reference_text = get_reference_text_with_priority(
+        cut, use_itn=use_itn, use_whisper_result=use_whisper_result
+    )
+
     turns = [
-        AudioTurn(cut=cut, role="user", audio_locator_tag=audio_locator_tag, text=cut.supervisions[0].text),
-        TextTurn(value=cut.supervisions[0].text, role="assistant"),
+        AudioTurn(cut=cut, role="user", audio_locator_tag=audio_locator_tag, text=reference_text),
+        TextTurn(value=reference_text, role="assistant"),
     ]
     if hasattr(cut, "context") and cut.context:  # Only add if context is non-empty
         turns = [TextTurn(value=cut.context, role="user")] + turns
@@ -504,11 +537,20 @@ def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
     # We need to attach them before cuts are converted to conversations.
     if (extra_tags := config.get("tags")) is not None:
         cuts = cuts.map(partial(attach_tags, tags=extra_tags), apply_fn=None)
+
+    # Get use_itn and use_whisper_result from config (defaults to True for backward compatibility)
+    # These flags control priority-based text selection from custom metadata fields,
+    # matching se-trainer's configurable behavior
+    use_itn = config.get("use_itn", True)
+    use_whisper_result = config.get("use_whisper_result", True)
+
     cuts = cuts.map(
         partial(
             cut_to_conversation,
             audio_locator_tag=config.audio_locator_tag,
             token_equivalent_duration=config.token_equivalent_duration,
+            use_itn=use_itn,
+            use_whisper_result=use_whisper_result,
         )
     )
     return cuts, is_tarred

@@ -131,6 +131,21 @@ class LhotseDataLoadingConfig:
     min_tpt: int = -1  # allowed tokens per token (text-only)
     max_tpt: Any = float("inf")  # float | list[float]
 
+    # 2.3 Custom text selection and data quality filters (SpeechLM2)
+    #   a. Text selection from custom metadata (for lhotse shar datasets with custom fields)
+    use_itn: bool = True  # Use ITN (Inverse Text Normalization) text from custom.itn if available
+    use_whisper_result: bool = True  # Use Whisper ASR output from custom.whisper_result if available
+    asr_context_prompt: str | None = None  # Optional ASR context prompt for custom processing
+    #   b. Data quality filters (applied during sampling, before bucketing)
+    similarity_threshold: float = 0.0  # Filter cuts with similarity < threshold (0.0 = disabled)
+    filter_keywords: Any = None  # List of keywords to filter: ["word"] or [["word", prob]]
+    filter_patterns: Any = None  # List of regex patterns to filter: ["regex"] or [["regex", prob]]
+    filter_brackets_except_tokens: bool = False  # Filter invalid angle brackets (requires tokenizer_dir)
+    tokenizer_dir: str | None = None  # Path to tokenizer directory with vocab.txt (for bracket filtering)
+    filter_debug_mode: bool = False  # Enable detailed filtering logs
+    filter_log_interval: int = 100000  # Log filter statistics every N samples (default: 100k)
+    filter_enable_periodic_stats: bool = False  # Enable periodic filter statistics logging (default: disabled)
+
     # 3. Supported existing NeMo options.
     shuffle: bool = False
     sample_rate: int = 16000
@@ -544,6 +559,64 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     if tokenizer is not None and config.pretokenize:
         cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))
         cuts = cuts.filter(TokenPerTokenFilter(config.min_tpt, config.max_tpt))
+
+    # ============================================================================
+    # Data Configuration Logging (Rank 0 only to prevent log flooding)
+    # ============================================================================
+    # Log text selection settings (use_itn, use_whisper_result)
+    if global_rank == 0:
+        use_itn = config.get('use_itn', True)
+        use_whisper_result = config.get('use_whisper_result', True)
+        logging.info("=" * 80)
+        logging.info("Text Selection Configuration:")
+        logging.info(f"  use_itn            : {use_itn}")
+        logging.info(f"  use_whisper_result : {use_whisper_result}")
+
+    # Apply optional data quality filters (similarity and keyword filtering)
+    # These filters enable fine-grained data curation for improved model quality
+    # All filters are disabled by default (100% backward compatibility)
+    has_similarity_filter = config.get('similarity_threshold', 0.0) > 0
+    has_keyword_filter = config.get('filter_keywords') is not None or config.get('filter_patterns') is not None
+
+    if has_similarity_filter or has_keyword_filter:
+        if global_rank == 0:
+            logging.info("Data Filtering Configuration:")
+
+    if has_similarity_filter:
+        from nemo.collections.speechlm2.data.filters import SimilarityFilter
+
+        similarity_threshold = config.similarity_threshold
+        if global_rank == 0:
+            logging.info(f"  SimilarityFilter   : threshold={similarity_threshold:.2f}")
+
+        similarity_filter = SimilarityFilter(
+            similarity_threshold=similarity_threshold,
+            log_interval=config.get('filter_log_interval', 100000),
+            enable_periodic_stats=config.get('filter_enable_periodic_stats', False),
+        )
+        cuts = cuts.filter(similarity_filter)
+
+    if has_keyword_filter:
+        from nemo.collections.speechlm2.data.filters import KeywordFilter
+
+        keyword_filter = KeywordFilter(
+            keywords=config.get('filter_keywords'),
+            patterns=config.get('filter_patterns'),
+            filter_brackets_except_tokens=config.get('filter_brackets_except_tokens', False),
+            tokenizer_dir=config.get('tokenizer_dir'),
+            debug_mode=config.get('filter_debug_mode', False),
+            log_interval=config.get('filter_log_interval', 100000),
+            enable_periodic_stats=config.get('filter_enable_periodic_stats', False),
+        )
+        cuts = cuts.filter(keyword_filter)
+        if global_rank == 0:
+            num_keywords = len(keyword_filter.keywords) if keyword_filter.keywords else 0
+            num_patterns = len(keyword_filter.patterns) if keyword_filter.patterns else 0
+            logging.info(f"  KeywordFilter      : {num_keywords} keywords, {num_patterns} patterns")
+
+    if has_similarity_filter or has_keyword_filter:
+        if global_rank == 0:
+            logging.info("=" * 80)
 
     # Select the strategy customizing Lhotse sampler behaviour.
     # Provides support for dynamic batch sizes, multimodal dataloading, 2D bucketing, etc.
