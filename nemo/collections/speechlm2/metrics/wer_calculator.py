@@ -28,11 +28,11 @@ Character Error Rate (CER) with support for different normalization strategies:
 Usage:
     # Legacy mode (default)
     calculator = create_wer_calculator(normalizer="legacy")
-    error_rate, stats = calculator.calculate(predictions, references)
+    error_rate, stats, norm_preds, norm_refs = calculator.calculate(predictions, references)
 
     # Open ASR Leaderboard mode
     calculator = create_wer_calculator(normalizer="open_asr_leaderboard")
-    error_rate, stats = calculator.calculate(
+    error_rate, stats, norm_preds, norm_refs = calculator.calculate(
         predictions, references, language="en", metric_type="wer"
     )
 """
@@ -59,7 +59,7 @@ class WERCalculatorBase(ABC):
         references: List[str],
         language: str = "en",
         metric_type: str = "wer",
-    ) -> Tuple[float, Dict]:
+    ) -> Tuple[float, Dict, List[str], List[str]]:
         """
         Calculate error rate with optional normalization.
 
@@ -74,12 +74,17 @@ class WERCalculatorBase(ABC):
                 - 'cer': Character Error Rate (character-level)
 
         Returns:
-            Tuple of (error_rate, stats_dict) where:
+            Tuple of (error_rate, stats_dict, normalized_predictions, normalized_references) where:
                 - error_rate: Float between 0.0 and 1.0+ (can exceed 1.0 with many insertions)
                 - stats_dict: Dictionary with calculation details
                     - 'total_errors': Total number of errors (S+D+I)
                     - 'total_units': Total number of reference units (words or characters)
+                    - 'substitutions': Number of substitution errors
+                    - 'deletions': Number of deletion errors
+                    - 'insertions': Number of insertion errors
                     - Additional calculator-specific statistics
+                - normalized_predictions: List of normalized prediction strings (after text cleaning)
+                - normalized_references: List of normalized reference strings (after text cleaning)
         """
         pass
 
@@ -95,6 +100,7 @@ class LegacyWERCalculator(WERCalculatorBase):
     - Simple word/character splitting
     - Direct editdistance calculation
     - Basic empty reference handling
+    - Chat template role marker removal (for accurate ASR metrics)
 
     Limitations:
     - No normalization (punctuation, contractions, numbers preserved as-is)
@@ -108,13 +114,19 @@ class LegacyWERCalculator(WERCalculatorBase):
         references: List[str],
         language: str = "en",
         metric_type: str = "wer",
-    ) -> Tuple[float, Dict]:
+    ) -> Tuple[float, Dict, List[str], List[str]]:
         import editdistance
+        from .normalization import remove_chat_template_roles
 
         total_errors = 0
         total_units = 0
 
-        for pred, ref in zip(predictions, references):
+        # Clean predictions and references by removing chat template role markers
+        # This ensures WER/CER only measures ASR transcription accuracy, not prompt tokens
+        cleaned_predictions = [remove_chat_template_roles(p) for p in predictions]
+        cleaned_references = [remove_chat_template_roles(r) for r in references]
+
+        for pred, ref in zip(cleaned_predictions, cleaned_references):
             # Split into units (words for WER, characters for CER)
             if metric_type == "wer":
                 pred_units = pred.split()
@@ -134,11 +146,15 @@ class LegacyWERCalculator(WERCalculatorBase):
         stats = {
             "total_errors": total_errors,
             "total_units": total_units,
+            "substitutions": 0,  # Legacy mode doesn't track detailed breakdown
+            "deletions": 0,
+            "insertions": 0,
             "normalizer": "legacy",
             "metric_type": metric_type,
         }
 
-        return error_rate, stats
+        # Return cleaned text (with chat template markers removed)
+        return error_rate, stats, cleaned_predictions, cleaned_references
 
 
 class OpenASRLeaderboardWERCalculator(WERCalculatorBase):
@@ -196,7 +212,7 @@ class OpenASRLeaderboardWERCalculator(WERCalculatorBase):
         references: List[str],
         language: str = "en",
         metric_type: str = "wer",
-    ) -> Tuple[float, Dict]:
+    ) -> Tuple[float, Dict, List[str], List[str]]:
         # Map language code to normalizer selection
         lang_code = self._map_language(language)
 
@@ -207,22 +223,26 @@ class OpenASRLeaderboardWERCalculator(WERCalculatorBase):
         norm_preds = [normalizer(p) if p.strip() else "" for p in predictions]
         norm_refs = [normalizer(r) if r.strip() else "" for r in references]
 
-        # Calculate WER/CER with proper empty string handling
-        error_rate, empty_stats, total_errors, total_units = self.calculate_wer_fn(
+        # Calculate WER/CER with proper empty string handling (now returns S/D/I breakdown)
+        error_rate, empty_stats, total_errors, total_units, substitutions, deletions, insertions = self.calculate_wer_fn(
             norm_preds, norm_refs, metric_type
         )
 
-        # Prepare statistics
+        # Prepare statistics with detailed error breakdown
         stats = {
             "total_errors": total_errors,
             "total_units": total_units,
+            "substitutions": substitutions,
+            "deletions": deletions,
+            "insertions": insertions,
             "normalizer": "open_asr_leaderboard",
             "language": lang_code,
             "metric_type": metric_type,
             "empty_handling": empty_stats,
         }
 
-        return error_rate, stats
+        # Return normalized text for logging transparency
+        return error_rate, stats, norm_preds, norm_refs
 
     def _map_language(self, lang: str) -> str:
         """

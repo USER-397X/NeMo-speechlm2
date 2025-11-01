@@ -30,6 +30,66 @@ except ImportError:
     regex = None
 
 
+def remove_chat_template_roles(s: str) -> str:
+    """
+    Remove chat template role markers from text for accurate WER/CER calculation.
+
+    This function removes role markers that are part of chat templates (e.g., ChatML format)
+    but should NOT be included in ASR metric calculations. It handles:
+    - Special tokens: <|im_start|>, <|im_end|>, <|endoftext|>, </think>
+    - Role markers at string start: "assistant", "user", "system" (case-insensitive)
+    - Repeated role markers: "assistantassistant assistant" → removed entirely
+    - Role markers with or without spaces: "assistantI" or "assistant I" → "I"
+
+    Important: Only removes role markers at the START of the string to avoid incorrectly
+    removing legitimate words like "The assistant helped me" in actual transcriptions.
+
+    Args:
+        s: Input text potentially containing chat template markers
+
+    Returns:
+        Cleaned text with chat template markers removed
+
+    Examples:
+        >>> remove_chat_template_roles("<|im_start|>assistant Hello world")
+        "Hello world"
+        >>> remove_chat_template_roles("assistantassistant assistant I think")
+        "I think"
+        >>> remove_chat_template_roles("</think>assistant Hello")
+        "Hello"
+        >>> remove_chat_template_roles("The assistant helped me")  # NOT removed
+        "The assistant helped me"
+    """
+    if not s:
+        return s
+
+    # Remove special tokens (angle bracket format and other thinking tokens)
+    # Handles: <|im_start|>, <|im_end|>, <|endoftext|>, </think>, etc.
+    s = re.sub(r"<\|[^|]+\|>", "", s)
+    s = re.sub(r"</think>", "", s, flags=re.IGNORECASE)
+
+    # Remove role markers at the start of the string
+    # Pattern explanation:
+    # ^             - Start of string
+    # (             - Start capture group
+    #   \s*         - Optional whitespace
+    #   (assistant|user|system)  - Role marker (case-insensitive)
+    # )+            - One or more repetitions (handles "assistantassistant assistant")
+    # \s*           - Optional trailing whitespace
+    #
+    # This pattern handles:
+    # - "assistant hello" → "hello"
+    # - "assistantassistant I" → "I"
+    # - "assistant assistant hello" → "hello"
+    # - "  assistant  hello" → "hello"
+    s = re.sub(r"^(\s*(assistant|user|system))+\s*", "", s, flags=re.IGNORECASE)
+
+    # Clean up any extra whitespace
+    s = s.strip()
+
+    return s
+
+
 # Non-ASCII letters that are not separated by "NFKD" normalization
 ADDITIONAL_DIACRITICS = {
     "œ": "oe",
@@ -1835,6 +1895,10 @@ class BasicMultilingualTextNormalizer:
         self.clean = remove_symbols_and_diacritics if remove_diacritics else remove_symbols
 
     def __call__(self, s: str):
+        # FIRST: Remove chat template role markers (before any other processing)
+        # This ensures accurate WER/CER by excluding prompt tokens from comparison
+        s = remove_chat_template_roles(s)
+
         s = s.lower()
         s = re.sub(r"[<\[][^>\]]*[>\]]", "", s)  # remove words between brackets
         s = re.sub(r"\(([^)]+?)\)", "", s)  # remove words between parenthesis
@@ -2347,6 +2411,10 @@ class EnglishTextNormalizer:
         self.standardize_spellings = EnglishSpellingNormalizer(english_spelling_mapping)
 
     def __call__(self, s: str):
+        # FIRST: Remove chat template role markers (before any other processing)
+        # This ensures accurate WER/CER by excluding prompt tokens from comparison
+        s = remove_chat_template_roles(s)
+
         s = s.lower()
 
         s = re.sub(r"[<\[][^>\]]*[>\]]", "", s)  # Remove words between brackets
