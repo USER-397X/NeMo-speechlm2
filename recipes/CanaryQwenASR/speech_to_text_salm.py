@@ -242,6 +242,17 @@ def main(cfg: DictConfig):
             # Get context prompt from config, or use official default
             context_prompt = cfg.data.train_ds.get('asr_context_prompt', 'Transcribe the following: ')
 
+            # ENHANCED: Get custom metadata text selection flags from config (defaults to True)
+            # These flags control priority-based reference text selection from lhotse shar custom fields
+            # - use_itn: Enable ITN (Inverse Text Normalization) text usage
+            # - use_whisper_result: Enable whisper_result ASR output usage
+            # Matching se-trainer implementation for consistent metadata handling
+            use_itn = cfg.data.train_ds.get('use_itn', True)
+            use_whisper_result = cfg.data.train_ds.get('use_whisper_result', True)
+
+            if rank == 0 and (not use_itn or not use_whisper_result):
+                logging.info(f"Custom metadata text selection: use_itn={use_itn}, use_whisper_result={use_whisper_result}")
+
             # Create input_cfg list
             input_cfg_list = []
             for shar_item in shar_paths:
@@ -250,6 +261,24 @@ def main(cfg: DictConfig):
                     weight = shar_item[1] if len(shar_item) >= 2 else 1.0
                     language = shar_item[2] if len(shar_item) >= 3 else 'en'
                     metric = shar_item[3] if len(shar_item) >= 4 else 'wer'
+                    # ENHANCED: Extract optional meta_db_path from 5th element (index 4)
+                    # Format: [shar_dir, weight, language, metric, meta_db_path]
+                    # This maintains 100% backward compatibility - meta_db_path is optional
+                    meta_db_path = shar_item[4] if len(shar_item) >= 5 else None
+
+                    # Build tags dictionary
+                    tags = {
+                        'context': context_prompt,
+                        'lang': language,
+                        'metric': metric,
+                    }
+
+                    # Add meta_db_path to tags if provided
+                    # This allows downstream processing to access external metadata if needed
+                    if meta_db_path:
+                        tags['meta_db_path'] = meta_db_path
+                        if rank == 0:
+                            logging.debug(f"Dataset '{shar_dir}' has meta_db_path: {meta_db_path}")
 
                     input_cfg_list.append({
                         'type': 'lhotse_as_conversation',
@@ -258,11 +287,11 @@ def main(cfg: DictConfig):
                         'audio_locator_tag': cfg.model.audio_locator_tag,
                         'token_equivalent_duration': cfg.data.train_ds.token_equivalent_duration,
                         'prompt_format': cfg.model.prompt_format,  # Add prompt_format here
-                        'tags': {
-                            'context': context_prompt,
-                            'lang': language,
-                            'metric': metric,
-                        }
+                        'tags': tags,
+                        # ENHANCED: Add custom metadata text selection flags to input_cfg
+                        # These are propagated to read_lhotse_as_conversation() in cutset.py
+                        'use_itn': use_itn,
+                        'use_whisper_result': use_whisper_result,
                     })
 
             # Only update if we have valid configs

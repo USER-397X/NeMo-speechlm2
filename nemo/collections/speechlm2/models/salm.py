@@ -98,16 +98,35 @@ class SALM(LightningModule, HFHubMixin):
 
         logging.info(f"WER Calculator initialized: {normalizer}")
 
-    def _format_prediction_log(self, idx, prompt, reference, prediction, wer, step_type="Validation", dataset_name="", audio_len_samples=None, metric_type="wer"):
+    def _format_prediction_log(
+        self,
+        idx,
+        prompt,
+        reference,
+        prediction,
+        reference_normalized,
+        prediction_normalized,
+        wer,
+        wer_stats,
+        language="en",
+        step_type="Validation",
+        dataset_name="",
+        audio_len_samples=None,
+        metric_type="wer"
+    ):
         """
-        Format prediction log in a clean, aligned format with token counts.
+        Format prediction log with enhanced information including normalized text and detailed error breakdown.
 
         Args:
             idx: Sample index
             prompt: Input prompt (may contain audio locator tags and formatting)
-            reference: Ground truth text
-            prediction: Model prediction
+            reference: Ground truth text (raw)
+            prediction: Model prediction (raw)
+            reference_normalized: Normalized ground truth text
+            prediction_normalized: Normalized prediction text
             wer: Word error rate (or CER if metric_type='cer')
+            wer_stats: Statistics dict from WER calculator with error breakdown
+            language: Language code for this sample
             step_type: "Training" or "Validation"
             dataset_name: Name of dataset (for validation)
             audio_len_samples: Audio length in samples (optional, for audio token count estimation)
@@ -118,78 +137,265 @@ class SALM(LightningModule, HFHubMixin):
         """
         lines = []
 
+        # Helper function to clean text for single-line display
+        def clean_text_for_display(text, max_length=120):
+            """
+            Clean text for display by removing newlines and control characters.
+
+            Args:
+                text: Input text to clean
+                max_length: Maximum display length before truncation
+
+            Returns:
+                Cleaned, single-line text suitable for logging
+            """
+            if not text:
+                return ""
+
+            # Replace all newline characters with space
+            cleaned = text.replace('\n', ' ').replace('\r', ' ')
+
+            # Replace tab characters with space
+            cleaned = cleaned.replace('\t', ' ')
+
+            # Remove other control characters (ASCII 0-31 except space)
+            import re
+            cleaned = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', cleaned)
+
+            # Compress multiple consecutive spaces into single space
+            cleaned = re.sub(r'\s+', ' ', cleaned)
+
+            # Strip leading/trailing whitespace
+            cleaned = cleaned.strip()
+
+            # Truncate if too long
+            if len(cleaned) > max_length:
+                cleaned = cleaned[:max_length] + "..."
+
+            return cleaned
+
+        # Language display name mapping
+        lang_names = {
+            "en": "English", "ko": "Korean", "ja": "Japanese", "zh": "Chinese",
+            "de": "German", "es": "Spanish", "fr": "French", "hi": "Hindi",
+            "it": "Italian", "pl": "Polish", "pt": "Portuguese",
+            "th": "Thai", "vi": "Vietnamese"
+        }
+        lang_code = language.split('-')[0] if '-' in language else language
+        lang_name = lang_names.get(lang_code, language.upper())
+
+        # Determine normalizer type from stats
+        normalizer_type = wer_stats.get('normalizer', 'legacy')
+        if normalizer_type == "open_asr_leaderboard":
+            normalizer_display = "EnglishNorm" if lang_code == "en" else "MultilingualNorm"
+        else:
+            normalizer_display = "Legacy (no normalization)"
+
+        # Unit type for display
+        unit_type = "chars" if metric_type == 'cer' else "words"
+
         # Calculate token counts using tokenizer
         def count_tokens(text):
             """Count actual tokens in text using the tokenizer."""
             if not text or text.strip() == "":
                 return 0
-            # Remove audio locator tags before tokenizing for accurate text token count
+            # Remove audio locator tags before tokenizing
             text_without_audio = text.replace(self.audio_locator_tag, "").strip()
             if not text_without_audio:
                 return 0
             tokens = self.tokenizer.text_to_ids(text_without_audio)
             return len(tokens) if tokens else 0
 
-        # Estimate audio embedding frames from audio length
-        audio_frames = 0
-        if audio_len_samples is not None and audio_len_samples > 0:
-            audio_duration_sec = audio_len_samples / self.sampling_rate
-            audio_frames = int(audio_duration_sec / self.token_equivalent_duration)
-
-        # Clean and prepare text for display
-        if prompt:
-            prompt_display = prompt.replace('\n', ' ').strip()
-            # Remove audio tag for prompt display (will show separately)
-            prompt_display_clean = prompt_display.replace(self.audio_locator_tag, "").strip()
-            # Truncate if too long
-            if len(prompt_display_clean) > 150:
-                prompt_display_clean = prompt_display_clean[:150] + "..."
+        # Count units in raw text (words or characters)
+        if metric_type == 'cer':
+            ref_raw_count = len(reference)
+            pred_raw_count = len(prediction)
         else:
-            prompt_display = ""
-            prompt_display_clean = "(no prompt)"
+            ref_raw_count = len(reference.split())
+            pred_raw_count = len(prediction.split())
 
-        # Clean references and predictions
-        ref_display = reference.replace('\n', ' ').strip()
-        pred_display = prediction.replace('\n', ' ').strip()
+        # Count units in normalized text
+        total_units = wer_stats.get('total_units', ref_raw_count)
+        if metric_type == 'cer':
+            pred_norm_count = len(prediction_normalized)
+        else:
+            pred_norm_count = len(prediction_normalized.split())
 
-        # Create full LLM input format (prompt + audio placeholder + reference)
+        # Estimate audio embedding frames
+        audio_frames = 0
+        audio_duration = None
+        if audio_len_samples is not None and audio_len_samples > 0:
+            audio_duration = audio_len_samples / self.sampling_rate
+            audio_frames = int(audio_duration / self.token_equivalent_duration)
+
+        # Clean all text for single-line display (removes newlines, control chars, truncates)
+        ref_raw_display = clean_text_for_display(reference, max_length=120)
+        pred_raw_display = clean_text_for_display(prediction, max_length=120)
+        ref_norm_display = clean_text_for_display(reference_normalized, max_length=120)
+        pred_norm_display = clean_text_for_display(prediction_normalized, max_length=120)
+
+        # Clean prompt for display (remove audio tag for cleaner output)
         if prompt:
-            prompt_for_full = prompt.replace('\n', ' ').strip()
-            # Insert audio locator tag to show where audio embeddings are inserted
-            if self.audio_locator_tag in prompt_for_full:
-                full_llm_input = f"{prompt_for_full} {ref_display}"
-            else:
-                full_llm_input = f"{prompt_for_full} {self.audio_locator_tag} {ref_display}"
-            # Truncate if too long
+            prompt_clean = prompt.replace(self.audio_locator_tag, "")
+            prompt_display = clean_text_for_display(prompt_clean, max_length=150)
+            prompt_tokens = count_tokens(prompt)
+        else:
+            prompt_display = "(no prompt)"
+            prompt_tokens = 0
+
+        # Create full LLM input (prompt + audio + reference) - cleaned for display
+        if prompt:
+            full_input_parts = [clean_text_for_display(prompt, max_length=300)]
+            if self.audio_locator_tag not in prompt:
+                full_input_parts.append(self.audio_locator_tag)
+            full_input_parts.append(clean_text_for_display(reference, max_length=200))
+            full_llm_input = " ".join(full_input_parts)
+            # Truncate combined result if still too long
             if len(full_llm_input) > 200:
                 full_llm_input = full_llm_input[:200] + "..."
         else:
-            full_llm_input = ref_display
+            full_llm_input = clean_text_for_display(reference, max_length=200)
 
-        # Calculate token counts
-        prompt_tokens = count_tokens(prompt) if prompt else 0
-        ref_tokens = count_tokens(reference)
-        pred_tokens = count_tokens(prediction)
-        # Full LLM input token count = prompt tokens + audio frames + reference tokens
-        full_tokens = prompt_tokens + audio_frames + ref_tokens
+        full_tokens = prompt_tokens + audio_frames + count_tokens(reference)
+
+        # Extract error breakdown from stats
+        total_errors = wer_stats.get('total_errors', 0)
+        subs = wer_stats.get('substitutions', 0)
+        dels = wer_stats.get('deletions', 0)
+        ins = wer_stats.get('insertions', 0)
 
         # Format dataset info
         dataset_info = f" [{dataset_name}]" if dataset_name else ""
 
-        # Define label padding for alignment (longest label is "Full LLM Input" = 14 chars)
-        label_width = 15
-
-        # Build aligned log entries with token counts
-        # Display metric type dynamically (WER or CER)
+        # Build aligned log with separator
+        separator = "=" * 100
         metric_display = metric_type.upper()
-        lines.append("=" * 100)
-        lines.append(f"{step_type} Sample {idx + 1}{dataset_info} | {metric_display}: {wer:.2%}")
-        lines.append(f"{'Full LLM Input':<{label_width}}: {full_llm_input} ({full_tokens})")
-        lines.append(f"{'Prompt':<{label_width}}: {prompt_display_clean} ({prompt_tokens})")
-        lines.append(f"{'Audio Token':<{label_width}}: {self.audio_locator_tag} → [audio_embeddings] ({audio_frames})")
-        lines.append(f"{'Ground Truth':<{label_width}}: {ref_display} ({ref_tokens})")
-        lines.append(f"{'Prediction':<{label_width}}: {pred_display} ({pred_tokens})")
-        lines.append("=" * 100)
+
+        # Start with blank line and separator
+        lines.append("")
+        lines.append(separator)
+        lines.append(f"{step_type} Sample {idx + 1}{dataset_info}")
+
+        # Audio duration if available
+        if audio_duration is not None:
+            lines.append(f"Audio Duration          : {audio_duration:.2f} sec")
+
+        # Language and metric info
+        lines.append(f"Language                : {lang_name} ({language})")
+        lines.append(f"Metric Type             : {metric_display}")
+        lines.append(f"Normalizer              : {normalizer_display}")
+
+        # Separator for better visual grouping
+        lines.append("-" * 100)
+
+        # Calculate reference tokens for comprehensive token breakdown
+        ref_tokens = count_tokens(reference)
+
+        # LLM Input Composition with comprehensive token information
+        lines.append(f"Prompt                  : {prompt_display} ({prompt_tokens} tokens)")
+
+        # Enhanced audio embeddings info with frame-to-token mapping
+        if audio_duration is not None and audio_frames > 0:
+            # Calculate detailed metrics
+            frame_rate = audio_frames / audio_duration  # frames per second
+            ms_per_frame = (audio_duration / audio_frames) * 1000  # milliseconds per frame
+
+            # Get embedding dimension from perception module if available
+            try:
+                embed_dim = self.perception.modality_adapter.d_model  # Conformer adapter dimension
+            except AttributeError:
+                embed_dim = None
+
+            # Calculate compression ratio if audio samples available
+            compression_ratio = None
+            if audio_len_samples is not None and audio_len_samples > 0 and audio_frames > 0:
+                compression_ratio = audio_len_samples / audio_frames
+
+            # Main audio embeddings line with frame=token mapping and dimension
+            # In SALM, each audio frame becomes one token in LLM input
+            if embed_dim is not None:
+                lines.append(
+                    f"Audio Embeddings        : {self.audio_locator_tag} → [audio_embeddings] "
+                    f"({audio_frames} frames ≡ {audio_frames} tokens, {embed_dim}d)"
+                )
+            else:
+                lines.append(
+                    f"Audio Embeddings        : {self.audio_locator_tag} → [audio_embeddings] "
+                    f"({audio_frames} frames ≡ {audio_frames} tokens)"
+                )
+
+            # Detailed temporal and compression information
+            temporal_info = f"{audio_duration:.2f}s @ {ms_per_frame:.0f}ms/frame ({frame_rate:.1f}fps)"
+            if compression_ratio is not None:
+                lines.append(
+                    f"  └─ Temporal           : {temporal_info} | "
+                    f"Compression: {audio_len_samples:,} samples → {audio_frames} frames (↓{compression_ratio:.0f}x)"
+                )
+            else:
+                lines.append(f"  └─ Temporal           : {temporal_info}")
+
+            # Additional embedding size information
+            if embed_dim is not None:
+                total_values = audio_frames * embed_dim
+                lines.append(f"  └─ Embedding Size     : {audio_frames} × {embed_dim}d = {total_values:,} values")
+        else:
+            # Fallback when audio duration not available
+            try:
+                embed_dim = self.perception.modality_adapter.d_model
+                lines.append(
+                    f"Audio Embeddings        : {self.audio_locator_tag} → [audio_embeddings] "
+                    f"({audio_frames} frames ≡ {audio_frames} tokens, {embed_dim}d)"
+                )
+                # Embedding size even without duration
+                total_values = audio_frames * embed_dim
+                lines.append(f"  └─ Embedding Size     : {audio_frames} × {embed_dim}d = {total_values:,} values")
+            except AttributeError:
+                lines.append(
+                    f"Audio Embeddings        : {self.audio_locator_tag} → [audio_embeddings] "
+                    f"({audio_frames} frames ≡ {audio_frames} tokens)"
+                )
+
+        lines.append(f"Reference Text          : {clean_text_for_display(reference, max_length=80)} ({ref_tokens} tokens)")
+
+        # Token Distribution Summary - comprehensive breakdown
+        lines.append("-" * 100)
+        lines.append(
+            f"LLM Input Token Summary : {full_tokens} tokens total "
+            f"(Prompt: {prompt_tokens} + Audio: {audio_frames} + Reference: {ref_tokens})"
+        )
+
+        # Calculate token usage percentage if model has max context length
+        try:
+            max_context = getattr(self.llm, 'max_position_embeddings', None) or \
+                         getattr(self.llm.config, 'max_position_embeddings', None)
+            if max_context:
+                usage_pct = (full_tokens / max_context) * 100
+                lines.append(f"Token Usage             : {usage_pct:.1f}% of max context length ({max_context:,} tokens)")
+        except (AttributeError, TypeError):
+            # Skip if max context not available
+            pass
+
+        # Separator for better visual grouping
+        lines.append("-" * 100)
+
+        # Raw text (before normalization, includes chat template markers)
+        lines.append(f"Reference (raw)         : {ref_raw_display} ({ref_raw_count} {unit_type})")
+        lines.append(f"Prediction (raw)        : {pred_raw_display} ({pred_raw_count} {unit_type})")
+
+        # Normalized text (after chat template removal + text normalization for WER/CER)
+        # Chat role markers like "assistant", "user", "system" are removed for accurate ASR metrics
+        lines.append(f"Reference (normalized)  : {ref_norm_display} ({total_units} {unit_type})")
+        lines.append(f"Prediction (normalized) : {pred_norm_display} ({pred_norm_count} {unit_type})")
+
+        # Separator for better visual grouping
+        lines.append("-" * 100)
+
+        # WER/CER with detailed error breakdown
+        lines.append(
+            f"{metric_display}                     : {wer*100:.2f}% | "
+            f"Errors: {total_errors} (S: {subs}, D: {dels}, I: {ins}) / {total_units} {unit_type}"
+        )
+        lines.append(separator)
 
         return lines
 
@@ -411,10 +617,31 @@ class SALM(LightningModule, HFHubMixin):
 
                 # Get language/metric for this sample (fallback to 'en'/'wer' if not available)
                 sample_language = language[i] if isinstance(language, list) and i < len(language) else (language if isinstance(language, str) else 'en')
-                sample_metric = metric_type[i] if isinstance(metric_type, list) and i < len(metric_type) else (metric_type if isinstance(metric_type, str) else 'wer')
+
+                # Extract metric_type with robust type checking and conversion
+                if isinstance(metric_type, list) and i < len(metric_type):
+                    metric_value = metric_type[i]
+                else:
+                    metric_value = metric_type
+
+                # Ensure metric_value is a string (handle int, float, or other types)
+                if isinstance(metric_value, str):
+                    sample_metric = metric_value
+                else:
+                    # Convert non-string types to string or use default
+                    sample_metric = str(metric_value) if metric_value is not None else 'wer'
+                    # If converted value is not a valid metric name, default to 'wer'
+                    if sample_metric not in ['wer', 'cer']:
+                        sample_metric = 'wer'
 
                 # Compute sample WER using configured calculator
-                sample_wer, wer_stats = self.wer_calculator.calculate(
+                # IMPORTANT: WER calculator automatically removes chat template role markers
+                # (e.g., "assistant", "user", "system") to ensure accurate ASR-only metrics.
+                # Both predictions and references are cleaned before WER calculation.
+                # This happens in:
+                #   - EnglishTextNormalizer/BasicMultilingualTextNormalizer (open_asr_leaderboard mode)
+                #   - LegacyWERCalculator.calculate() (legacy mode)
+                sample_wer, wer_stats, norm_preds, norm_refs = self.wer_calculator.calculate(
                     predictions=[prediction],
                     references=[reference],
                     language=sample_language,
@@ -424,13 +651,17 @@ class SALM(LightningModule, HFHubMixin):
                 # Get audio length for this sample (in samples)
                 audio_len = batch["audio_lens"][i].item() if i < len(batch["audio_lens"]) else None
 
-                # Log using clean format helper with audio length for token count
+                # Log using enhanced format with raw and normalized text
                 log_lines = self._format_prediction_log(
                     idx=i,
                     prompt=prompt,
                     reference=reference,
                     prediction=prediction,
+                    reference_normalized=norm_refs[0] if norm_refs else reference,
+                    prediction_normalized=norm_preds[0] if norm_preds else prediction,
                     wer=sample_wer,
+                    wer_stats=wer_stats,
+                    language=sample_language,
                     step_type="Training",
                     audio_len_samples=audio_len,
                     metric_type=sample_metric
@@ -586,10 +817,31 @@ class SALM(LightningModule, HFHubMixin):
 
                     # Get language/metric for this sample
                     sample_language = language[idx] if isinstance(language, list) and idx < len(language) else (language if isinstance(language, str) else 'en')
-                    sample_metric = metric_type[idx] if isinstance(metric_type, list) and idx < len(metric_type) else (metric_type if isinstance(metric_type, str) else 'wer')
+
+                    # Extract metric_type with robust type checking and conversion
+                    if isinstance(metric_type, list) and idx < len(metric_type):
+                        metric_value = metric_type[idx]
+                    else:
+                        metric_value = metric_type
+
+                    # Ensure metric_value is a string (handle int, float, or other types)
+                    if isinstance(metric_value, str):
+                        sample_metric = metric_value
+                    else:
+                        # Convert non-string types to string or use default
+                        sample_metric = str(metric_value) if metric_value is not None else 'wer'
+                        # If converted value is not a valid metric name, default to 'wer'
+                        if sample_metric not in ['wer', 'cer']:
+                            sample_metric = 'wer'
 
                     # Compute WER for this sample using configured calculator
-                    sample_wer, wer_stats = self.wer_calculator.calculate(
+                    # IMPORTANT: WER calculator automatically removes chat template role markers
+                    # (e.g., "assistant", "user", "system") to ensure accurate ASR-only metrics.
+                    # Both predictions and references are cleaned before WER calculation.
+                    # This happens in:
+                    #   - EnglishTextNormalizer/BasicMultilingualTextNormalizer (open_asr_leaderboard mode)
+                    #   - LegacyWERCalculator.calculate() (legacy mode)
+                    sample_wer, wer_stats, norm_preds, norm_refs = self.wer_calculator.calculate(
                         predictions=[hypotheses[idx]],
                         references=[references[idx]],
                         language=sample_language,
@@ -599,13 +851,17 @@ class SALM(LightningModule, HFHubMixin):
                     # Get audio length for this sample (in samples)
                     audio_len = dataset_batch["audio_lens"][idx].item() if idx < len(dataset_batch["audio_lens"]) else None
 
-                    # Log using clean format helper with audio length for token count
+                    # Log using enhanced format with raw and normalized text
                     log_lines = self._format_prediction_log(
                         idx=idx,
                         prompt=prompt,
                         reference=references[idx],
                         prediction=hypotheses[idx],
+                        reference_normalized=norm_refs[0] if norm_refs else references[idx],
+                        prediction_normalized=norm_preds[0] if norm_preds else hypotheses[idx],
                         wer=sample_wer,
+                        wer_stats=wer_stats,
+                        language=sample_language,
                         step_type="Validation",
                         dataset_name=name,
                         audio_len_samples=audio_len,
@@ -628,7 +884,9 @@ class SALM(LightningModule, HFHubMixin):
 
                 # Calculate WER using configured calculator for the entire batch
                 # We need numerator and denominator for proper distributed aggregation
-                _, batch_stats = self.wer_calculator.calculate(
+                # IMPORTANT: WER calculator automatically removes chat template role markers
+                # from both hypotheses and references before calculation (same as training_step)
+                _, batch_stats, _, _ = self.wer_calculator.calculate(
                     predictions=hypotheses,
                     references=references,
                     language=language[0] if language else 'en',  # Use first sample's language
