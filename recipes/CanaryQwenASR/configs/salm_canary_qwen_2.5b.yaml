@@ -109,6 +109,17 @@ data:
     # ASR task context prompt - MATCHES OFFICIAL CANARY-QWEN-2.5B TRAINING
     asr_context_prompt: "Transcribe the following: "
 
+    # Custom Metadata Text Selection Options (for lhotse shar datasets with custom metadata):
+    # Controls priority-based reference text selection from custom metadata fields.
+    # Priority hierarchy (when both flags are True):
+    #   1. custom.ground_truth_transcript (always used if present - highest quality)
+    #   2. custom.itn (conditional on use_itn=True - Inverse Text Normalization)
+    #   3. custom.whisper_result (conditional on use_whisper_result=True - richer text preferred)
+    #   4. supervisions[0].text (fallback - default lhotse manifest text)
+    # Default: True for both (uses all available metadata for best quality)
+    use_itn: true                    # Enable ITN (Inverse Text Normalization) text usage
+    use_whisper_result: true         # Enable whisper_result ASR output usage
+
     # Dataset configuration using lhotse_as_conversation for SALM
     # This automatically converts ASR-only shar datasets to conversational format (auto-converted to input_cfg by speech_to_text_salm.py)
     use_lhotse: true
