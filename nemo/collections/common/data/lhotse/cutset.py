@@ -202,6 +202,9 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "skip_missing_manifest_entries": config.get("skip_missing_manifest_entries", False),
         "force_map_dataset": config.get("force_map_dataset", False),
         "force_iterable_dataset": config.get("force_iterable_dataset", False),
+        # Text case normalization options (propagated to all datasets)
+        "convert_all_uppercase_to_lowercase": config.get("convert_all_uppercase_to_lowercase", True),
+        "capitalize_first_letter": config.get("capitalize_first_letter", True),
     }
     cuts, is_tarred = parse_and_combine_datasets(config.input_cfg, propagate_attrs=propagate_attrs)
     return cuts, is_tarred
@@ -469,7 +472,9 @@ def cut_to_conversation(
     audio_locator_tag: str,
     token_equivalent_duration: float,
     use_itn: bool = True,
-    use_whisper_result: bool = True,
+    use_whisper_result: bool = False,
+    convert_all_uppercase_to_lowercase: bool = True,
+    capitalize_first_letter: bool = True,
 ) -> NeMoMultimodalConversation:
     """
     Converts a lhotse Cut into a two-turn NeMoMultimodalConversation, where the user turn contains cut's audio,
@@ -490,6 +495,8 @@ def cut_to_conversation(
         token_equivalent_duration: Audio duration per token conversion ratio
         use_itn: Enable ITN text usage (default: True)
         use_whisper_result: Enable whisper_result usage (default: True)
+        convert_all_uppercase_to_lowercase: Convert all-uppercase text to lowercase (default: False)
+        capitalize_first_letter: Capitalize first letter if all lowercase (default: False)
 
     Returns:
         NeMoMultimodalConversation with configured text selection
@@ -511,7 +518,11 @@ def cut_to_conversation(
     from nemo.collections.speechlm2.data.text_utils import get_reference_text_with_priority
 
     reference_text = get_reference_text_with_priority(
-        cut, use_itn=use_itn, use_whisper_result=use_whisper_result
+        cut,
+        use_itn=use_itn,
+        use_whisper_result=use_whisper_result,
+        convert_all_uppercase_to_lowercase=convert_all_uppercase_to_lowercase,
+        capitalize_first_letter=capitalize_first_letter
     )
 
     turns = [
@@ -533,16 +544,46 @@ def cut_to_conversation(
 @data_type_parser(["lhotse_as_conversation"])
 def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
     cuts, is_tarred = read_cutset_from_config(config)
+
+    # Multi-utterance support: trim cuts with multiple supervisions into individual cuts
+    # This enables processing of long recordings with many utterances (e.g., 419 supervisions)
+    # Each supervision becomes a separate training sample for better data utilization
+    if config.get("trim_multi_utterance", True):  # Default: enabled
+        try:
+            # Peek at first cut to check if multi-utterance processing is needed
+            first_cut = next(iter(cuts))
+            if len(first_cut.supervisions) > 1:
+                logging.info(
+                    f"Multi-utterance detected: {len(first_cut.supervisions)} supervisions in first cut. "
+                    f"Applying trim_to_supervisions()..."
+                )
+                # Split each cut into multiple cuts (one per supervision)
+                cuts = cuts.trim_to_supervisions(
+                    keep_all_channels=True,   # Preserve channel information
+                    keep_overlapping=True     # Keep overlapping supervisions
+                )
+                # Filter out empty cuts (safety check for zero-duration supervisions)
+                cuts = cuts.filter(lambda c: c.duration > 0)
+                logging.info("Multi-utterance trim completed successfully.")
+        except (StopIteration, AttributeError, IndexError):
+            # Empty CutSet or no supervisions - skip trimming gracefully
+            pass
+
     # Attach extra tags to every utterance dynamically, if provided.
     # We need to attach them before cuts are converted to conversations.
     if (extra_tags := config.get("tags")) is not None:
         cuts = cuts.map(partial(attach_tags, tags=extra_tags), apply_fn=None)
 
-    # Get use_itn and use_whisper_result from config (defaults to True for backward compatibility)
+    # Get use_itn and use_whisper_result from config
     # These flags control priority-based text selection from custom metadata fields,
     # matching se-trainer's configurable behavior
+    # Defaults: use_itn=True (enable ITN), use_whisper_result=False (disable Whisper by default)
     use_itn = config.get("use_itn", True)
-    use_whisper_result = config.get("use_whisper_result", True)
+    use_whisper_result = config.get("use_whisper_result", False)
+
+    # Get text case normalization options from config (defaults to True)
+    convert_all_uppercase_to_lowercase = config.get("convert_all_uppercase_to_lowercase", True)
+    capitalize_first_letter = config.get("capitalize_first_letter", True)
 
     cuts = cuts.map(
         partial(
@@ -551,6 +592,8 @@ def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
             token_equivalent_duration=config.token_equivalent_duration,
             use_itn=use_itn,
             use_whisper_result=use_whisper_result,
+            convert_all_uppercase_to_lowercase=convert_all_uppercase_to_lowercase,
+            capitalize_first_letter=capitalize_first_letter,
         )
     )
     return cuts, is_tarred
