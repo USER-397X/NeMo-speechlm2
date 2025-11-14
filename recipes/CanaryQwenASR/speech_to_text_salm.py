@@ -242,16 +242,26 @@ def main(cfg: DictConfig):
             # Get context prompt from config, or use official default
             context_prompt = cfg.data.train_ds.get('asr_context_prompt', 'Transcribe the following: ')
 
-            # ENHANCED: Get custom metadata text selection flags from config (defaults to True)
+            # ENHANCED: Get custom metadata text selection flags from config
             # These flags control priority-based reference text selection from lhotse shar custom fields
-            # - use_itn: Enable ITN (Inverse Text Normalization) text usage
-            # - use_whisper_result: Enable whisper_result ASR output usage
+            # - use_itn: Enable ITN (Inverse Text Normalization) text usage (default: True)
+            # - use_whisper_result: Enable whisper_result ASR output usage (default: False)
             # Matching se-trainer implementation for consistent metadata handling
             use_itn = cfg.data.train_ds.get('use_itn', True)
-            use_whisper_result = cfg.data.train_ds.get('use_whisper_result', True)
+            use_whisper_result = cfg.data.train_ds.get('use_whisper_result', False)
+
+            # ENHANCED: Get text case normalization flags from config (defaults to True)
+            # These flags control text case normalization applied to all selected reference text
+            # - convert_all_uppercase_to_lowercase: Convert all-uppercase text to lowercase (e.g., "HELLO" → "hello")
+            # - capitalize_first_letter: Capitalize first letter if all lowercase (e.g., "hello" → "Hello")
+            convert_all_uppercase_to_lowercase = cfg.data.train_ds.get('convert_all_uppercase_to_lowercase', True)
+            capitalize_first_letter = cfg.data.train_ds.get('capitalize_first_letter', True)
 
             if rank == 0 and (not use_itn or not use_whisper_result):
                 logging.info(f"Custom metadata text selection: use_itn={use_itn}, use_whisper_result={use_whisper_result}")
+
+            if rank == 0 and (convert_all_uppercase_to_lowercase or capitalize_first_letter):
+                logging.info(f"Text case normalization: convert_all_uppercase_to_lowercase={convert_all_uppercase_to_lowercase}, capitalize_first_letter={capitalize_first_letter}")
 
             # Create input_cfg list
             input_cfg_list = []
@@ -292,6 +302,10 @@ def main(cfg: DictConfig):
                         # These are propagated to read_lhotse_as_conversation() in cutset.py
                         'use_itn': use_itn,
                         'use_whisper_result': use_whisper_result,
+                        # ENHANCED: Add text case normalization flags to input_cfg
+                        # These are propagated to read_lhotse_as_conversation() → cut_to_conversation() → get_reference_text_with_priority()
+                        'convert_all_uppercase_to_lowercase': convert_all_uppercase_to_lowercase,
+                        'capitalize_first_letter': capitalize_first_letter,
                     })
 
             # Only update if we have valid configs
