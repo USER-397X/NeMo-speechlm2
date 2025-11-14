@@ -166,7 +166,11 @@ def add_punctuation(text: str, whisper_result: str, lang: str) -> str:
 
 
 def get_reference_text_with_priority(
-    cut, use_itn: bool = True, use_whisper_result: bool = True
+    cut,
+    use_itn: bool = True,
+    use_whisper_result: bool = False,
+    convert_all_uppercase_to_lowercase: bool = True,
+    capitalize_first_letter: bool = True
 ) -> str:
     """
     Get reference text with configurable priority-based selection from custom metadata fields.
@@ -193,8 +197,12 @@ def get_reference_text_with_priority(
         cut: Lhotse Cut object with optional custom metadata fields
         use_itn: Enable ITN text usage (default: True)
                  When False, starts from supervisions.text instead of custom metadata
-        use_whisper_result: Enable whisper_result usage (default: True)
+        use_whisper_result: Enable whisper_result usage (default: False)
                            When False, skips whisper_result entirely
+        convert_all_uppercase_to_lowercase: Convert all-uppercase text to lowercase (default: False)
+                                           Example: "HELLO WORLD" → "hello world"
+        capitalize_first_letter: Capitalize first letter if all lowercase (default: False)
+                                Example: "hello world" → "Hello world"
 
     Returns:
         str: Selected reference text based on priority logic and flags
@@ -246,7 +254,7 @@ def get_reference_text_with_priority(
 
     Notes:
         - **EXACT se-trainer match**: use_itn controls starting point, not just itn field
-        - Maintains 100% backward compatibility: defaults to True for both flags
+        - Defaults: use_itn=True (enable ITN priority), use_whisper_result=False (disable Whisper by default)
         - If custom fields don't exist, falls back to supervisions[0].text
         - Empty strings are treated as missing values
         - The alphanumeric count comparison ensures we prefer more informative text
@@ -296,5 +304,78 @@ def get_reference_text_with_priority(
                 if count_alphanumeric(whisper_result) >= count_alphanumeric(selected_text):
                     selected_text = whisper_result
 
-    # Final fallback: return fallback_text if selected_text is empty
-    return selected_text if selected_text else fallback_text
+    # Apply text case normalization before returning
+    final_text = selected_text if selected_text else fallback_text
+    final_text = apply_text_case_normalization(
+        final_text,
+        convert_all_uppercase_to_lowercase=convert_all_uppercase_to_lowercase,
+        capitalize_first_letter=capitalize_first_letter
+    )
+
+    return final_text
+
+
+def apply_text_case_normalization(
+    text: str,
+    convert_all_uppercase_to_lowercase: bool = True,
+    capitalize_first_letter: bool = True
+) -> str:
+    """
+    Apply text case normalization rules to training data.
+
+    This function implements two optional text case transformations that can improve
+    model training by normalizing inconsistent text capitalization patterns.
+
+    Args:
+        text: Input text string to normalize
+        convert_all_uppercase_to_lowercase: If True, converts all-uppercase text to lowercase
+                                            Example: "HELLO WORLD" → "hello world"
+        capitalize_first_letter: If True, capitalizes first letter if text is all lowercase
+                                Example: "hello world" → "Hello world"
+
+    Returns:
+        str: Normalized text string
+
+    Examples:
+        >>> # Option 1: Convert all uppercase to lowercase
+        >>> apply_text_case_normalization("HELLO WORLD", convert_all_uppercase_to_lowercase=True)
+        'hello world'
+
+        >>> # Option 2: Capitalize first letter
+        >>> apply_text_case_normalization("hello world", capitalize_first_letter=True)
+        'Hello world'
+
+        >>> # Both options enabled (order: uppercase→lowercase, then capitalize)
+        >>> apply_text_case_normalization("HELLO WORLD",
+        ...     convert_all_uppercase_to_lowercase=True,
+        ...     capitalize_first_letter=True)
+        'Hello world'
+
+        >>> # No transformation if text is mixed case
+        >>> apply_text_case_normalization("Hello World", capitalize_first_letter=True)
+        'Hello World'
+
+        >>> # Empty strings are handled safely
+        >>> apply_text_case_normalization("", capitalize_first_letter=True)
+        ''
+
+    Notes:
+        - Only processes non-empty strings
+        - Checks are case-sensitive (isupper(), islower())
+        - Mixed-case text is not transformed
+        - Both options can be enabled simultaneously
+        - Order: uppercase→lowercase first, then capitalize
+        - Matches se-trainer implementation exactly
+    """
+    if not text:  # Handle empty strings safely
+        return text
+
+    # Option 1: Convert all uppercase to lowercase
+    if convert_all_uppercase_to_lowercase and text.isupper():
+        text = text.lower()
+
+    # Option 2: Capitalize first letter if all lowercase
+    if capitalize_first_letter and text.islower():
+        text = text[0].upper() + text[1:] if len(text) > 0 else text
+
+    return text
