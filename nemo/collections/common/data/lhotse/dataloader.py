@@ -133,10 +133,13 @@ class LhotseDataLoadingConfig:
 
     # 2.3 Custom text selection and data quality filters (SpeechLM2)
     #   a. Text selection from custom metadata (for lhotse shar datasets with custom fields)
-    use_itn: bool = True  # Use ITN (Inverse Text Normalization) text from custom.itn if available
-    use_whisper_result: bool = True  # Use Whisper ASR output from custom.whisper_result if available
+    use_itn: bool = True  # Use ITN (Inverse Text Normalization) text from custom.itn if available (default: True)
+    use_whisper_result: bool = False  # Use Whisper ASR output from custom.whisper_result if available (default: False)
     asr_context_prompt: str | None = None  # Optional ASR context prompt for custom processing
-    #   b. Data quality filters (applied during sampling, before bucketing)
+    #   b. Text case normalization options
+    convert_all_uppercase_to_lowercase: bool = True  # Convert all-uppercase text to lowercase (e.g., "HELLO" → "hello")
+    capitalize_first_letter: bool = True  # Capitalize first letter if all lowercase (e.g., "hello" → "Hello")
+    #   c. Data quality filters (applied during sampling, before bucketing)
     similarity_threshold: float = 0.0  # Filter cuts with similarity < threshold (0.0 = disabled)
     filter_keywords: Any = None  # List of keywords to filter: ["word"] or [["word", prob]]
     filter_patterns: Any = None  # List of regex patterns to filter: ["regex"] or [["regex", prob]]
@@ -145,6 +148,9 @@ class LhotseDataLoadingConfig:
     filter_debug_mode: bool = False  # Enable detailed filtering logs
     filter_log_interval: int = 100000  # Log filter statistics every N samples (default: 100k)
     filter_enable_periodic_stats: bool = False  # Enable periodic filter statistics logging (default: disabled)
+    #   c. Multi-utterance processing
+    trim_multi_utterance: bool = True  # Auto-trim cuts with multiple supervisions to individual cuts (default: enabled)
+    eager_load_audio_for_transforms: bool = True  # Eager load audio for cuts with transforms (default: enabled, fixes AudioreadBackend bug)
 
     # 3. Supported existing NeMo options.
     shuffle: bool = False
@@ -481,6 +487,123 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # Resample as a safeguard; it's a no-op when SR is already OK
     cuts = cuts.map(partial(resample, sampling_rate=config.sample_rate), apply_fn=None)
 
+    # Fix for multi-utterance + resampling issue:
+    # Force eager audio loading for multi-utterance cuts with transforms to avoid AudioreadBackend bug
+    # with type='memory' + transforms + offset/duration combination
+    # Performance optimization: Only apply to cuts that actually need it (multi-utterance scenarios)
+    if config.get('eager_load_audio_for_transforms', True):
+        def needs_eager_loading(cut):
+            """
+            Check if cut needs eager audio loading to avoid AudioreadBackend bug.
+
+            Bug occurs ONLY when ALL three conditions are met:
+            1. Recording has transforms (e.g., Resample from 8kHz→16kHz)
+            2. Recording uses memory source (type='memory')
+            3. Cut uses partial recording (multi-utterance with offset/duration slicing)
+
+            This function detects conditions 1 and 3. Condition 2 is automatically
+            satisfied after cuts.resample() when sample rates differ.
+
+            Examples:
+            - 16kHz + Multi-utterance → transforms=[] → False (no eager loading needed)
+            - 8kHz + Multi-utterance → transforms=[Resample(...)] → True (eager loading needed)
+            - 8kHz + Single-utterance → transforms=[Resample(...)] but no partial → False (lazy loading OK)
+            - 16kHz + Single-utterance → transforms=[] → False (no eager loading needed)
+            """
+            # Condition 1: Check if cut has transforms
+            # Note: Lhotse's resample() only adds transforms when sample rates differ
+            # - recording.sampling_rate == target_sr → No transform added (no-op)
+            # - recording.sampling_rate != target_sr → Resample transform added
+            has_transforms = (
+                hasattr(cut, 'recording') and
+                cut.recording is not None and
+                hasattr(cut.recording, 'transforms') and
+                cut.recording.transforms is not None and
+                len(cut.recording.transforms) > 0
+            )
+
+            if not has_transforms:
+                # No transforms → sample rate already matches target
+                # No eager loading needed (works fine with lazy loading)
+                return False
+
+            # Condition 3: Check if cut uses partial recording (multi-utterance scenario)
+            # More robust detection using recording/cut duration ratio instead of fixed tolerance
+            # to avoid edge cases with very short utterances or float precision issues.
+            #
+            # Multi-utterance indicators:
+            # 1. Recording is significantly longer than cut (cut uses <90% of recording)
+            # 2. Cut starts after recording start (offset > 0.1s to avoid precision issues)
+            #
+            # This approach is more reliable than fixed tolerance (e.g., 10ms) because:
+            # - Handles recordings of any length correctly
+            # - Avoids false positives from trimmed silence or float rounding
+            # - Clearly distinguishes multi-utterance (e.g., 608s recording, 1.7s cut)
+            #   from single-utterance (e.g., 5.2s recording, 5.2s cut)
+
+            # Direct supervision count check (most reliable if available)
+            # Try to access recording.supervisions to determine if it's multi-utterance
+            # This is the most direct and accurate method
+            is_multi_utterance = False
+
+            try:
+                # Check if recording has supervisions attribute
+                if hasattr(cut.recording, 'supervisions') and cut.recording.supervisions is not None:
+                    # Multi-utterance: original recording has multiple supervisions
+                    num_recording_supervisions = len(cut.recording.supervisions)
+                    is_multi_utterance = num_recording_supervisions > 1
+                else:
+                    # Fallback: use duration-based heuristic
+                    # This handles cases where recording.supervisions is not available
+                    recording_duration = cut.recording.duration
+                    cut_duration = cut.duration
+
+                    # Check 1: Cut uses less than 90% of recording duration
+                    uses_partial_duration = cut_duration < recording_duration * 0.9
+
+                    # Check 2: Cut has non-zero offset (with 100ms tolerance)
+                    has_offset = cut.start > 0.1
+
+                    is_multi_utterance = uses_partial_duration or has_offset
+            except AttributeError:
+                # If any attribute access fails, fallback to duration-based heuristic
+                recording_duration = cut.recording.duration
+                cut_duration = cut.duration
+                uses_partial_duration = cut_duration < recording_duration * 0.9
+                has_offset = cut.start > 0.1
+                is_multi_utterance = uses_partial_duration or has_offset
+
+            # Only apply eager loading when BOTH conditions are met
+            # This minimizes performance impact on single-utterance datasets
+            return has_transforms and is_multi_utterance
+
+        def eager_load_if_needed(cut):
+            """Load audio to memory if cut has transforms and uses partial recording."""
+            if needs_eager_loading(cut):
+                # Optional debug logging (enable via environment variable)
+                # Set LHOTSE_EAGER_LOADING_DEBUG=1 to see which cuts trigger eager loading
+                import os
+                if os.environ.get('LHOTSE_EAGER_LOADING_DEBUG') == '1':
+                    # Check detection method used
+                    detection_method = "unknown"
+                    if hasattr(cut.recording, 'supervisions') and cut.recording.supervisions is not None:
+                        detection_method = f"supervision_count({len(cut.recording.supervisions)})"
+                    else:
+                        detection_method = "duration_ratio"
+
+                    logging.info(
+                        f"[EAGER_LOADING] Cut {cut.id[:8]}... "
+                        f"(start={cut.start:.2f}s, dur={cut.duration:.2f}s, "
+                        f"rec_dur={cut.recording.duration:.2f}s, "
+                        f"transforms={len(cut.recording.transforms)}, "
+                        f"method={detection_method})"
+                    )
+                # move_to_memory() loads audio and applies all transforms
+                return cut.move_to_memory(audio_format='wav')
+            return cut
+
+        cuts = cuts.map(eager_load_if_needed, apply_fn=None)
+
     # Expands cuts if multiple translations are provided.
     cuts = CutSet(LazyFlattener(cuts.map(_flatten_alt_text, apply_fn=None)))
 
@@ -564,13 +687,20 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # Data Configuration Logging (Rank 0 only to prevent log flooding)
     # ============================================================================
     # Log text selection settings (use_itn, use_whisper_result)
+    # Defaults: use_itn=True (enable ITN priority), use_whisper_result=False (disable Whisper by default)
     if global_rank == 0:
         use_itn = config.get('use_itn', True)
-        use_whisper_result = config.get('use_whisper_result', True)
+        use_whisper_result = config.get('use_whisper_result', False)
+        convert_all_uppercase_to_lowercase = config.get('convert_all_uppercase_to_lowercase', True)
+        capitalize_first_letter = config.get('capitalize_first_letter', True)
+
         logging.info("=" * 80)
         logging.info("Text Selection Configuration:")
         logging.info(f"  use_itn            : {use_itn}")
         logging.info(f"  use_whisper_result : {use_whisper_result}")
+        logging.info("Text Case Normalization:")
+        logging.info(f"  convert_all_uppercase_to_lowercase : {convert_all_uppercase_to_lowercase}")
+        logging.info(f"  capitalize_first_letter             : {capitalize_first_letter}")
 
     # Apply optional data quality filters (similarity and keyword filtering)
     # These filters enable fine-grained data curation for improved model quality
