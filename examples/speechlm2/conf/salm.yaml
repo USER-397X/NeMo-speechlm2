@@ -18,6 +18,19 @@ model:
   prompt_format: llama2
   audio_locator_tag: "<|audioplaceholder|>"  # placeholder token for audio turn is expected
 
+  # WER Calculator Configuration
+  # Controls which WER calculation method is used for evaluation
+  wer_calculator:
+    # normalizer: "legacy" | "open_asr_leaderboard"
+    # - "legacy": Simple editdistance.eval() without text normalization (backward compatible)
+    # - "open_asr_leaderboard": HuggingFace Open ASR Leaderboard compliant with full normalization
+    #   Supports:
+    #   - English normalization (contractions, numbers, British-American spelling, punctuation)
+    #   - Multilingual normalization (diacritic removal, Unicode normalization)
+    #   - WER (Word Error Rate) and CER (Character Error Rate)
+    #   - Proper empty string handling
+    normalizer: "legacy"  # Default: backward compatible mode
+
   # Note: Uncomment the block below to enable LoRA on LLM via HuggingFace PEFT library.
   #   It will automatically freeze LLM parameters even if freeze_params was unused,
   #   and prevent freezing any parameter that has the string '.lora_' in its name.
@@ -102,6 +115,22 @@ data:
     sample_rate: 16000
     prompt_format: ${model.prompt_format}
     token_equivalent_duration: 0.08
+
+    # Custom Metadata Text Selection Options (for lhotse shar datasets):
+    # Controls priority-based reference text selection from custom metadata fields.
+    # When lhotse cuts have custom metadata (ground_truth_transcript, itn, whisper_result),
+    # these flags control which fields to use for reference text selection.
+    #
+    # Priority hierarchy (when both flags are True):
+    #   1. custom.ground_truth_transcript (always used if present)
+    #   2. custom.itn (conditional on use_itn=True)
+    #   3. custom.whisper_result (conditional on use_whisper_result=True, richer text preferred)
+    #   4. supervisions[0].text (fallback)
+    #
+    # Default: True for both (maintains backward compatibility and uses all available metadata)
+    use_itn: true                    # Enable ITN (Inverse Text Normalization) text usage
+    use_whisper_result: true         # Enable whisper_result ASR output usage
+
     input_cfg:
       - type: lhotse_as_conversation
         cuts_path: ???  # needs to be set
@@ -110,6 +139,23 @@ data:
           # Uncomment below line to include a system prompt.
           # system_prompt: "some system prompt"
           context: "Repeat after me, typing in lowercase."
+    # Language and Metric Metadata for Multilingual Datasets:
+    # The WER calculator uses language and metric metadata from Cut.custom dict.
+    # When creating lhotse manifests, add metadata to each Cut:
+    #
+    # Example (in your data preparation script):
+    #   cut = Cut(...)
+    #   cut.custom = {
+    #     "lang": "en-US",      # Language code: "en", "en-US", "ko-KR", "ja-JP", "zh-CN", etc.
+    #     "metric": "wer"       # Metric type: "wer" for word-level, "cer" for character-level
+    #   }
+    #
+    # Multilingual training dataset example:
+    #   - English dataset: lang="en-US", metric="wer"
+    #   - Korean dataset: lang="ko-KR", metric="wer"
+    #   - Chinese dataset: lang="zh-CN", metric="cer"
+    #
+    # Default values: lang="en", metric="wer" (used if not specified)
     seed: 42
     shuffle: true
     shard_seed: "randomized"
@@ -145,6 +191,25 @@ data:
               # Uncomment below line to include a system prompt.
               # system_prompt: "some system prompt"
               context: "Repeat after me, typing in lowercase."
+        # Language and Metric Metadata for Validation Datasets:
+        # Similar to training, validation datasets use Cut.custom for metadata.
+        # When using JSON manifest files, include lang/metric fields:
+        #
+        # Example JSON manifest entry:
+        # {
+        #   "audio_filepath": "path/to/audio.wav",
+        #   "text": "ground truth transcription",
+        #   "duration": 5.2,
+        #   "lang": "en-US",     # Optional: language code (default: "en")
+        #   "metric": "wer"      # Optional: metric type (default: "wer")
+        # }
+        #
+        # These fields will be extracted and stored in Cut.custom during manifest loading.
+        #
+        # Multilingual validation example:
+        #   val_set_english: lang="en-US", metric="wer"
+        #   val_set_korean: lang="ko-KR", metric="wer"
+        #   val_set_chinese: lang="zh-CN", metric="cer"
     sample_rate: 16000
     batch_size: 1
     seed: 42
