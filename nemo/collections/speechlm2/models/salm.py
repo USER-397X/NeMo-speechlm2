@@ -53,7 +53,19 @@ from nemo.utils import logging
 
 
 class SALM(LightningModule, HFHubMixin):
-    def __init__(self, cfg, skip_perception_setup: bool = False) -> None:
+    def __init__(self, cfg, skip_perception_setup: bool = False, resume_from_salm: str = None) -> None:
+        """
+        Initialize SALM model.
+
+        Args:
+            cfg: Model configuration dict
+            skip_perception_setup: If True, skip perception module setup entirely.
+                                   Use this only for restore_from() where weights are loaded via load_state_dict().
+            resume_from_salm: Path to SALM checkpoint (.nemo or .ckpt) to resume from.
+                             When set, loads perception config and weights from this checkpoint
+                             instead of from pretrained_asr. This allows resuming training
+                             without requiring the original pretrained_asr file.
+        """
         assert isinstance(cfg, dict), (
             "You must pass the config to SALM as a Python dict to support hyperparameter serialization "
             f"in PTL checkpoints (we got: '{type(cfg)=}')."
@@ -73,8 +85,19 @@ class SALM(LightningModule, HFHubMixin):
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
-        # Skip during restore_from() since weights will be loaded via load_state_dict()
-        if not skip_perception_setup:
+        # Three modes:
+        # 1. skip_perception_setup=True: Skip entirely (for restore_from(), weights loaded via load_state_dict())
+        # 2. resume_from_salm set: Load perception from SALM checkpoint (for resume training)
+        # 3. Default: Load from pretrained_asr model (for initial training)
+        if skip_perception_setup:
+            # Mode 1: Skip entirely - weights will be loaded via load_state_dict() later
+            logging.info("Skipping perception setup (weights will be loaded via load_state_dict)")
+        elif resume_from_salm:
+            # Mode 2: Load perception from SALM checkpoint
+            logging.info(f"Setting up perception from SALM checkpoint: {resume_from_salm}")
+            setup_speech_encoder(self, checkpoint_path=resume_from_salm)
+        else:
+            # Mode 3: Load from pretrained ASR model
             setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
 
         self._use_fsdp = False
@@ -1401,6 +1424,160 @@ class SALM(LightningModule, HFHubMixin):
             strict=strict,
             **model_kwargs,
         )
+
+    def load_weights_from(
+        self,
+        path: str,
+        strict: bool = False,
+    ) -> tuple[list, list]:
+        """
+        Load model weights from a .nemo or .ckpt file into this existing model instance.
+
+        This method only loads model weights - optimizer and scheduler states are NOT restored.
+        Use this for:
+        - Fine-tuning from a pretrained SALM checkpoint
+        - Resuming training with fresh optimizer (e.g., different learning rate schedule)
+        - Transfer learning scenarios
+
+        For full training resume (weights + optimizer + scheduler + step), use
+        exp_manager.resume_from_checkpoint instead.
+
+        Args:
+            path: Path to .nemo or .ckpt file containing model weights
+            strict: If True, raises error when keys don't match exactly.
+                   If False (default), loads matching weights and logs mismatches.
+
+        Returns:
+            Tuple of (missing_keys, unexpected_keys) lists
+
+        Example:
+            >>> model = SALM(cfg)
+            >>> missing, unexpected = model.load_weights_from("trained_model.nemo")
+            >>> print(f"Loaded weights with {len(missing)} missing, {len(unexpected)} unexpected keys")
+
+            >>> # Or from .ckpt file
+            >>> model.load_weights_from("checkpoint-step=10000.ckpt")
+        """
+        import os
+        import tarfile
+        import tempfile
+        from pathlib import Path
+
+        path = os.path.abspath(os.path.expanduser(path))
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Cannot find checkpoint file: {path}")
+
+        suffix = Path(path).suffix.lower()
+
+        if suffix == '.nemo':
+            # Load from .nemo archive
+            logging.info(f"Loading weights from .nemo file: {path}")
+            state_dict = self._extract_state_dict_from_nemo(path)
+
+        elif suffix == '.ckpt':
+            # Load from PyTorch Lightning checkpoint
+            logging.info(f"Loading weights from .ckpt file: {path}")
+            state_dict = self._extract_state_dict_from_ckpt(path)
+
+        else:
+            raise ValueError(
+                f"Unsupported file format: {suffix}. "
+                f"Expected .nemo or .ckpt file."
+            )
+
+        # Load weights into model
+        missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=strict)
+
+        # Log loading results
+        if missing_keys:
+            logging.warning(f"Missing keys when loading weights: {len(missing_keys)}")
+            if len(missing_keys) <= 10:
+                for key in missing_keys:
+                    logging.debug(f"  - {key}")
+            else:
+                for key in missing_keys[:5]:
+                    logging.debug(f"  - {key}")
+                logging.debug(f"  ... and {len(missing_keys) - 5} more")
+
+        if unexpected_keys:
+            logging.warning(f"Unexpected keys when loading weights: {len(unexpected_keys)}")
+            if len(unexpected_keys) <= 10:
+                for key in unexpected_keys:
+                    logging.debug(f"  - {key}")
+            else:
+                for key in unexpected_keys[:5]:
+                    logging.debug(f"  - {key}")
+                logging.debug(f"  ... and {len(unexpected_keys) - 5} more")
+
+        if not missing_keys and not unexpected_keys:
+            logging.info("All weights loaded successfully (exact match)")
+        else:
+            logging.info(
+                f"Weights loaded with {len(missing_keys)} missing and "
+                f"{len(unexpected_keys)} unexpected keys"
+            )
+
+        return missing_keys, unexpected_keys
+
+    def _extract_state_dict_from_nemo(self, nemo_path: str) -> dict:
+        """
+        Extract model state_dict from a .nemo archive file.
+
+        Args:
+            nemo_path: Path to .nemo file
+
+        Returns:
+            Model state_dict
+        """
+        import tarfile
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Try uncompressed first (NeMo 1.7.0+), fallback to gzip
+            try:
+                with tarfile.open(nemo_path, "r:") as tar:
+                    tar.extractall(tmpdir)
+            except tarfile.ReadError:
+                with tarfile.open(nemo_path, "r:gz") as tar:
+                    tar.extractall(tmpdir)
+
+            # Load weights
+            import os
+            weights_path = os.path.join(tmpdir, "model_weights.ckpt")
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(
+                    f"model_weights.ckpt not found in .nemo archive: {nemo_path}"
+                )
+
+            state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
+            return state_dict
+
+    def _extract_state_dict_from_ckpt(self, ckpt_path: str) -> dict:
+        """
+        Extract model state_dict from a PyTorch Lightning .ckpt file.
+
+        Args:
+            ckpt_path: Path to .ckpt file
+
+        Returns:
+            Model state_dict
+        """
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+        # PyTorch Lightning stores model weights under 'state_dict' key
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            # Log checkpoint info
+            if 'epoch' in checkpoint:
+                logging.info(f"  Source checkpoint epoch: {checkpoint['epoch']}")
+            if 'global_step' in checkpoint:
+                logging.info(f"  Source checkpoint step: {checkpoint['global_step']}")
+        else:
+            # Assume it's a raw state_dict
+            state_dict = checkpoint
+
+        return state_dict
 
     def configure_model(self) -> None:
         # TODO(pzelasko): refactor into separate module re-usable across models
