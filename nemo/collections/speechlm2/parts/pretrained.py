@@ -731,8 +731,51 @@ def setup_speech_encoder(
     if checkpoint_path is not None:
         logger.info(f"Setting up speech encoder from checkpoint: {checkpoint_path}")
 
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # Load checkpoint - supports both .ckpt and .nemo formats
+        checkpoint_path_obj = Path(checkpoint_path)
+        suffix = checkpoint_path_obj.suffix.lower()
+
+        if suffix == '.nemo':
+            # Load from .nemo archive (tar file containing model_weights.ckpt and model_config.yaml)
+            import tarfile
+            import tempfile
+            from omegaconf import OmegaConf
+
+            logger.info(f"Loading perception from .nemo file: {checkpoint_path}")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Extract .nemo archive
+                try:
+                    with tarfile.open(checkpoint_path, "r:") as tar:
+                        tar.extractall(tmpdir)
+                except tarfile.ReadError:
+                    with tarfile.open(checkpoint_path, "r:gz") as tar:
+                        tar.extractall(tmpdir)
+
+                # Load config
+                config_path = Path(tmpdir) / "model_config.yaml"
+                if not config_path.exists():
+                    raise RuntimeError(f"model_config.yaml not found in .nemo archive: {checkpoint_path}")
+                nemo_cfg = OmegaConf.load(config_path)
+
+                # Load weights
+                weights_path = Path(tmpdir) / "model_weights.ckpt"
+                if not weights_path.exists():
+                    raise RuntimeError(f"model_weights.ckpt not found in .nemo archive: {checkpoint_path}")
+                nemo_state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
+
+            # Build checkpoint-like structure for unified processing
+            checkpoint = {
+                'hyper_parameters': {'cfg': OmegaConf.to_container(nemo_cfg, resolve=True)},
+                'state_dict': nemo_state_dict
+            }
+        elif suffix == '.ckpt':
+            # Load from PyTorch Lightning checkpoint
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        else:
+            raise ValueError(
+                f"Unsupported checkpoint format: {suffix}. "
+                f"Expected .nemo or .ckpt file."
+            )
 
         # Extract perception config from checkpoint
         if 'hyper_parameters' not in checkpoint or 'cfg' not in checkpoint['hyper_parameters']:
