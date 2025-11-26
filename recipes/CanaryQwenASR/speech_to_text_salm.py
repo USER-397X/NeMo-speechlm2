@@ -209,17 +209,117 @@ def main(cfg: DictConfig):
     if rank == 0:
         logging.info(f"Training Configuration: {cfg.trainer.devices} GPU(s) on {nodes} node(s)")
 
+    # ============================================================================
+    # SALM Checkpoint Resume Configuration
+    # ============================================================================
+    # Two modes available:
+    #   - weights_only: Load model weights only, fresh optimizer/scheduler
+    #   - full_resume:  Load everything (weights + optimizer + scheduler + step)
+    # ============================================================================
+    resume_from_salm = cfg.model.get('resume_from_salm', None)
+    resume_mode = cfg.model.get('resume_mode', 'weights_only')
+
+    # ============================================================================
+    # Common typo detection and warning
+    # ============================================================================
+    # Check for common typos in yaml config that can cause silent failures
+    common_typos = {
+        'resume_model': 'resume_mode',
+        'resume_salm': 'resume_from_salm',
+        'resumemode': 'resume_mode',
+        'resumefromsalm': 'resume_from_salm',
+    }
+    for typo, correct in common_typos.items():
+        if typo in cfg.model:
+            logging.warning("=" * 80)
+            logging.warning(f"⚠️  YAML CONFIG WARNING: Detected '{typo}' in config!")
+            logging.warning(f"    Did you mean '{correct}'?")
+            logging.warning(f"    Current value of '{typo}': {cfg.model.get(typo)}")
+            logging.warning(f"    This key is being IGNORED - using default for '{correct}'")
+            logging.warning("=" * 80)
+
+    # Validate resume_mode
+    if resume_mode not in ['weights_only', 'full_resume']:
+        raise ValueError(
+            f"Invalid resume_mode: '{resume_mode}'. "
+            f"Must be 'weights_only' or 'full_resume'."
+        )
+
+    # For full_resume mode, configure exp_manager to use the checkpoint
+    if resume_from_salm and resume_mode == 'full_resume':
+        if rank == 0:
+            logging.info("=" * 80)
+            logging.info("[FULL RESUME MODE] Configuring complete training state restoration")
+            logging.info(f"  Checkpoint: {resume_from_salm}")
+            logging.info("  Will restore: model weights + optimizer + scheduler + global_step + epoch")
+            logging.info("=" * 80)
+
+        # Validate: full_resume requires .ckpt file (not .nemo)
+        if resume_from_salm.endswith('.nemo'):
+            raise ValueError(
+                f"full_resume mode requires a .ckpt file, but got .nemo file: {resume_from_salm}\n"
+                f".nemo files do not contain optimizer/scheduler state.\n"
+                f"Use resume_mode: weights_only for .nemo files."
+            )
+
+        # Set exp_manager to use the checkpoint for full resume
+        # This will make PyTorch Lightning restore the complete training state
+        with open_dict(cfg):
+            if 'exp_manager' not in cfg:
+                cfg.exp_manager = {}
+            cfg.exp_manager.resume_from_checkpoint = resume_from_salm
+            cfg.exp_manager.resume_if_exists = True
+            cfg.exp_manager.resume_ignore_no_checkpoint = True  # Allow resume even if log_dir is different
+
+    elif resume_from_salm and resume_mode == 'weights_only':
+        if rank == 0:
+            logging.info("=" * 80)
+            logging.info("[WEIGHTS ONLY MODE] Loading model weights with fresh optimizer")
+            logging.info(f"  Checkpoint: {resume_from_salm}")
+            logging.info("  Will restore: model weights only")
+            logging.info("  Fresh start:  optimizer, scheduler, global_step (starts from 0)")
+            logging.info("=" * 80)
+
     # Initialize trainer with custom progress bar
     trainer = Trainer(**trainer_cfg, callbacks=[SALMProgressBar()])
 
-    # Setup experiment manager
+    # Setup experiment manager (handles full_resume if configured above)
     exp_manager(trainer, cfg.get("exp_manager", None))
 
     # Initialize model
+    # When resuming from SALM checkpoint, pass the checkpoint path to SALM constructor
+    # so it can load perception config and weights from the checkpoint instead of pretrained_asr.
+    # This is needed for BOTH modes:
+    #   - weights_only: perception loaded here, then load_weights_from() loads rest
+    #   - full_resume: perception loaded here, then PTL loads full state (overwrites weights)
     if rank == 0:
-        logging.info("Initializing SALM model...")
+        if resume_from_salm:
+            logging.info(f"Initializing SALM model (resume_from_salm={resume_from_salm}, mode={resume_mode})...")
+        else:
+            logging.info("Initializing SALM model...")
     with trainer.init_module():
-        model = SALM(OmegaConf.to_container(cfg.model, resolve=True))
+        model = SALM(
+            OmegaConf.to_container(cfg.model, resolve=True),
+            resume_from_salm=resume_from_salm  # Pass in both modes for perception init
+        )
+
+    # ============================================================================
+    # Load weights from SALM checkpoint (weights_only mode)
+    # ============================================================================
+    # Note: When resume_from_salm is set, SALM.__init__() already loads perception weights
+    # from the checkpoint. Here we load the remaining weights (LLM, embed_tokens, LoRA, etc.)
+    #
+    # For full_resume mode, we skip this step because PyTorch Lightning will restore
+    # the complete state (including optimizer, scheduler, global_step) during trainer.fit()
+    if resume_from_salm and resume_mode == 'weights_only':
+        if rank == 0:
+            logging.info(f"[WEIGHTS ONLY] Loading remaining weights from: {resume_from_salm}")
+        model.load_weights_from(resume_from_salm)
+    elif resume_from_salm and resume_mode == 'full_resume':
+        if rank == 0:
+            logging.info(f"[FULL RESUME] Model weights will be loaded by PyTorch Lightning during trainer.fit()")
+            logging.info(f"  Checkpoint: {resume_from_salm}")
+            logging.info(f"  Will restore: model weights, optimizer state, scheduler state, global_step")
 
     if rank == 0:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
