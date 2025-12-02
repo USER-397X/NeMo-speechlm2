@@ -238,11 +238,11 @@ def main(cfg: DictConfig):
             logging.warning(f"    This key is being IGNORED - using default for '{correct}'")
             logging.warning("=" * 80)
 
-    # Validate resume_mode
-    if resume_mode not in ['weights_only', 'full_resume']:
+    # Validate resume_mode (only when resume_from_salm is set)
+    if resume_from_salm and resume_mode not in ['weights_only', 'full_resume']:
         raise ValueError(
             f"Invalid resume_mode: '{resume_mode}'. "
-            f"Must be 'weights_only' or 'full_resume'."
+            f"Must be 'weights_only' or 'full_resume' when resume_from_salm is set."
         )
 
     # For full_resume mode, configure exp_manager to use the checkpoint
